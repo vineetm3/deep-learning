@@ -55,6 +55,13 @@ def main(args):
     preprocessor.load(preprocessor_path)
     print(f"Loaded preprocessor from {preprocessor_path}")
     
+    # Adjust model config to match preprocessor vocab sizes
+    num_positions = len(preprocessor.position_to_idx)
+    if num_positions > config.model.num_positions:
+        config.model.num_positions = num_positions
+    # Ensure direction/side vocab sizes match (in case they changed)
+    config.model.position_embedding_dim = config.model.position_embedding_dim
+    
     # Create dataloaders
     print("\nCreating dataloaders...")
     _, _, test_loader = create_dataloaders(
