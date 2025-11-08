@@ -11,6 +11,28 @@ from pathlib import Path
 
 from src.data.preprocessing import NFLDataPreprocessor, get_play_ids
 
+INPUT_FEATURE_COLUMNS = [
+    'x',
+    'y',
+    's',
+    'a',
+    'dir',
+    'o',
+    'player_height_inches',
+    'player_weight',
+    'dist_to_ball',
+    'vx',
+    'vy',
+    'ax',
+    'ay',
+    'ball_dx',
+    'ball_dy',
+    'ball_dist',
+    'ball_angle_sin',
+    'ball_angle_cos',
+]
+FEATURE_INDEX = {name: idx for idx, name in enumerate(INPUT_FEATURE_COLUMNS)}
+
 
 class NFLTrajectoryDataset(Dataset):
     """
@@ -51,11 +73,7 @@ class NFLTrajectoryDataset(Dataset):
         print(f"Loaded {len(self.play_ids)} plays")
         
         # Feature columns for input
-        self.input_feature_cols = [
-            'x', 'y', 's', 'a', 'dir', 'o',  # Tracking features
-            'player_height_inches', 'player_weight',  # Physical features
-            'dist_to_ball',  # Derived feature
-        ]
+        self.input_feature_cols = INPUT_FEATURE_COLUMNS.copy()
         
         # Categorical feature columns
         self.categorical_cols = [

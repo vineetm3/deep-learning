@@ -3,6 +3,7 @@ Training utilities for trajectory prediction models
 """
 
 import torch
+import math
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -50,12 +51,23 @@ class Trainer:
         )
         
         # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=config.lr_factor,
-            patience=config.lr_patience,
-        )
+        scheduler_choice = getattr(config, 'lr_scheduler', 'reduce_on_plateau').lower()
+        self.scheduler_type = scheduler_choice
+        if scheduler_choice == 'cosine':
+            t_max = getattr(config, 'cosine_t_max', 10)
+            eta_min = getattr(config, 'cosine_eta_min', 1e-6)
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=t_max,
+                eta_min=eta_min,
+            )
+        else:
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=config.lr_factor,
+                patience=config.lr_patience,
+            )
         
         # Training state
         self.epoch = 0
@@ -65,6 +77,24 @@ class Trainer:
         # Checkpoint directory
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    
+    def _compute_teacher_forcing_ratio(self, epoch: int) -> float:
+        strategy = getattr(self.config, 'teacher_forcing_strategy', 'linear').lower()
+        initial = getattr(self.config, 'initial_teacher_forcing_ratio', 1.0)
+        final = getattr(self.config, 'final_teacher_forcing_ratio', 0.5)
+        decay_epochs = max(1, getattr(self.config, 'teacher_forcing_decay_epochs', 50))
+        
+        if strategy == 'exponential':
+            gamma = getattr(self.config, 'teacher_forcing_gamma', 0.9)
+            ratio = initial * (gamma ** epoch)
+        elif strategy == 'cosine':
+            progress = min(epoch / decay_epochs, 1.0)
+            ratio = final + 0.5 * (initial - final) * (1 + math.cos(progress * math.pi))
+        else:  # linear
+            progress = min(epoch / decay_epochs, 1.0)
+            ratio = initial * (1 - progress) + final * progress
+        
+        return max(final, min(initial, ratio))
     
     def train_epoch(self, teacher_forcing_ratio: float = 1.0) -> Dict[str, float]:
         """
@@ -197,14 +227,7 @@ class Trainer:
             self.epoch = epoch
             
             # Compute teacher forcing ratio (decay from initial to final)
-            if self.config.teacher_forcing_decay_epochs > 0:
-                progress = min(epoch / self.config.teacher_forcing_decay_epochs, 1.0)
-                teacher_forcing_ratio = (
-                    self.config.initial_teacher_forcing_ratio * (1 - progress) +
-                    self.config.final_teacher_forcing_ratio * progress
-                )
-            else:
-                teacher_forcing_ratio = self.config.final_teacher_forcing_ratio
+            teacher_forcing_ratio = self._compute_teacher_forcing_ratio(epoch)
             
             # Train epoch
             train_metrics = self.train_epoch(teacher_forcing_ratio)
@@ -213,7 +236,10 @@ class Trainer:
             val_metrics = self.validate()
             
             # Learning rate scheduling
-            self.scheduler.step(val_metrics['loss'])
+            if self.scheduler_type == 'cosine':
+                self.scheduler.step()
+            else:
+                self.scheduler.step(val_metrics['loss'])
             
             # Print metrics
             print(f"\nEpoch {epoch+1}/{num_epochs}")

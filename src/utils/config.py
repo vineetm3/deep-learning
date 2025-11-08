@@ -24,9 +24,9 @@ class DataConfig:
     
     # Feature columns
     position_features: list = field(default_factory=lambda: ['x', 'y'])
-    motion_features: list = field(default_factory=lambda: ['s', 'a', 'dir', 'o'])
+    motion_features: list = field(default_factory=lambda: ['s', 'a', 'dir', 'o', 'vx', 'vy', 'ax', 'ay'])
     static_features: list = field(default_factory=lambda: ['player_weight', 'absolute_yardline_number'])
-    ball_features: list = field(default_factory=lambda: ['ball_land_x', 'ball_land_y'])
+    ball_features: list = field(default_factory=lambda: ['ball_land_x', 'ball_land_y', 'ball_dx', 'ball_dy', 'ball_dist', 'ball_angle_sin', 'ball_angle_cos'])
     
     # Categorical features
     categorical_features: list = field(default_factory=lambda: ['player_role', 'player_position', 'player_side', 'play_direction'])
@@ -47,8 +47,17 @@ class DataConfig:
         'a': (0.0, 20.0),  # Acceleration (max observed ~17, add buffer)
         'dir': (0.0, 360.0),  # Direction in degrees
         'o': (0.0, 360.0),  # Orientation in degrees
+        'vx': (-15.0, 15.0),
+        'vy': (-15.0, 15.0),
+        'ax': (-20.0, 20.0),
+        'ay': (-20.0, 20.0),
         'ball_land_x': (0.0, 120.0),
         'ball_land_y': (-10.0, 60.0),  # Can be out of bounds
+        'ball_dx': (-60.0, 60.0),
+        'ball_dy': (-30.0, 30.0),
+        'ball_dist': (0.0, 70.0),
+        'ball_angle_sin': (-1.0, 1.0),
+        'ball_angle_cos': (-1.0, 1.0),
         'player_weight': (150.0, 350.0),
         'absolute_yardline_number': (0.0, 100.0),
     })
@@ -68,7 +77,7 @@ class ModelConfig:
     gnn_output_dim: int = 128
     gnn_num_layers: int = 2
     gnn_num_heads: int = 4  # For GAT
-    gnn_dropout: float = 0.1
+    gnn_dropout: float = 0.3
     
     # Graph construction
     k_nearest_neighbors: int = 5
@@ -76,7 +85,7 @@ class ModelConfig:
     # LSTM configuration
     lstm_hidden_dim: int = 256
     lstm_num_layers: int = 2
-    lstm_dropout: float = 0.2
+    lstm_dropout: float = 0.35
     
     # Role embeddings
     role_embedding_dim: int = 16
@@ -94,8 +103,8 @@ class ModelConfig:
 class TrainingConfig:
     """Training configuration"""
     # Optimization
-    learning_rate: float = 0.001
-    weight_decay: float = 1e-5
+    learning_rate: float = 5e-4
+    weight_decay: float = 5e-5
     batch_size: int = 32
     num_epochs: int = 100
     
@@ -104,8 +113,10 @@ class TrainingConfig:
     
     # Scheduled sampling
     initial_teacher_forcing_ratio: float = 1.0
-    final_teacher_forcing_ratio: float = 0.5
-    teacher_forcing_decay_epochs: int = 50
+    final_teacher_forcing_ratio: float = 0.2
+    teacher_forcing_decay_epochs: int = 10
+    teacher_forcing_strategy: str = "exponential"  # "linear", "exponential", "cosine"
+    teacher_forcing_gamma: float = 0.9
     
     # Loss weighting
     role_weights: dict = field(default_factory=lambda: {
@@ -116,8 +127,11 @@ class TrainingConfig:
     })
     
     # Learning rate scheduling
+    lr_scheduler: str = "cosine"  # "reduce_on_plateau" or "cosine"
     lr_patience: int = 5
     lr_factor: float = 0.5
+    cosine_t_max: int = 10
+    cosine_eta_min: float = 1e-5
     
     # Early stopping
     early_stopping_patience: int = 15

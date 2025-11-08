@@ -5,7 +5,18 @@ Graph construction for GNN-based trajectory prediction
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple
+
+from src.data.dataset import FEATURE_INDEX
+
+IDX_X = FEATURE_INDEX['x']
+IDX_Y = FEATURE_INDEX['y']
+IDX_VX = FEATURE_INDEX.get('vx')
+IDX_VY = FEATURE_INDEX.get('vy')
+IDX_AX = FEATURE_INDEX.get('ax')
+IDX_AY = FEATURE_INDEX.get('ay')
+IDX_BALL_SIN = FEATURE_INDEX.get('ball_angle_sin')
+IDX_BALL_COS = FEATURE_INDEX.get('ball_angle_cos')
 
 
 class GraphBuilder:
@@ -31,6 +42,7 @@ class GraphBuilder:
         ball_landing: torch.Tensor,
         player_roles: torch.Tensor,
         player_mask: torch.Tensor,
+        continuous_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Build graph structure for a batch of plays
@@ -66,9 +78,22 @@ class GraphBuilder:
             # Node offset for this batch item
             node_offset = b * (num_players + 1)
             
-            # Player positions (x, y are first two features)
-            player_positions = node_features[b, :num_real_players, :2]  # [num_real_players, 2]
+            player_continuous = continuous_features[b, :num_real_players]  # [num_real_players, feat]
+            player_positions = player_continuous[:, [IDX_X, IDX_Y]]
             ball_pos = ball_landing[b]  # [2]
+
+            # Extract velocity and acceleration components if available
+            def get_feature(idx: Optional[int]) -> torch.Tensor:
+                if idx is None or idx >= player_continuous.size(-1):
+                    return torch.zeros_like(player_positions[:, 0])
+                return player_continuous[:, idx]
+
+            vx = get_feature(IDX_VX)
+            vy = get_feature(IDX_VY)
+            ax = get_feature(IDX_AX)
+            ay = get_feature(IDX_AY)
+            ball_angle_sin = get_feature(IDX_BALL_SIN)
+            ball_angle_cos = get_feature(IDX_BALL_COS)
             
             # Edge list for this play
             edge_index = []
@@ -82,11 +107,23 @@ class GraphBuilder:
                 # Ball to player
                 edge_index.append([ball_node_idx, i])
                 
-                # Edge features: distance and relative position
-                dist = torch.norm(player_positions[i] - ball_pos).item()
+                # Edge features: distance, relative position, velocity and acceleration towards ball
                 rel_pos = player_positions[i] - ball_pos
-                
-                edge_feat = torch.tensor([dist, rel_pos[0].item(), rel_pos[1].item()], device=device)
+                dist = torch.norm(rel_pos).item()
+
+                rel_features = torch.tensor([
+                    dist,
+                    rel_pos[0].item(),
+                    rel_pos[1].item(),
+                    vx[i].item(),
+                    vy[i].item(),
+                    ax[i].item(),
+                    ay[i].item(),
+                    ball_angle_sin[i].item(),
+                    ball_angle_cos[i].item(),
+                ], device=device)
+                edge_features.append(rel_features)
+                edge_features.append(rel_features)
                 edge_features.append(edge_feat)
                 edge_features.append(edge_feat)  # Same for both directions
             
@@ -113,7 +150,19 @@ class GraphBuilder:
                         # Edge features
                         dist = distances[j].item()
                         rel_pos = player_positions[j] - player_positions[i]
-                        edge_feat = torch.tensor([dist, rel_pos[0].item(), rel_pos[1].item()], device=device)
+                        rel_vel = torch.tensor([vx[j] - vx[i], vy[j] - vy[i]], device=device)
+                        rel_acc = torch.tensor([ax[j] - ax[i], ay[j] - ay[i]], device=device)
+                        edge_feat = torch.tensor([
+                            dist,
+                            rel_pos[0].item(),
+                            rel_pos[1].item(),
+                            rel_vel[0].item(),
+                            rel_vel[1].item(),
+                            rel_acc[0].item(),
+                            rel_acc[1].item(),
+                            0.0,
+                            0.0,
+                        ], device=device)
                         edge_features.append(edge_feat)
             
             # 3. Role-specific edges (defensive coverage to targeted receiver)
@@ -136,9 +185,27 @@ class GraphBuilder:
                     edge_index.append([targeted_receiver_idx, coverage_idx])
                     
                     # Edge features
-                    dist = torch.norm(player_positions[coverage_idx] - player_positions[targeted_receiver_idx]).item()
                     rel_pos = player_positions[targeted_receiver_idx] - player_positions[coverage_idx]
-                    edge_feat = torch.tensor([dist, rel_pos[0].item(), rel_pos[1].item()], device=device)
+                    dist = torch.norm(rel_pos).item()
+                    rel_vel = torch.tensor([
+                        vx[targeted_receiver_idx] - vx[coverage_idx],
+                        vy[targeted_receiver_idx] - vy[coverage_idx],
+                    ], device=device)
+                    rel_acc = torch.tensor([
+                        ax[targeted_receiver_idx] - ax[coverage_idx],
+                        ay[targeted_receiver_idx] - ay[coverage_idx],
+                    ], device=device)
+                    edge_feat = torch.tensor([
+                        dist,
+                        rel_pos[0].item(),
+                        rel_pos[1].item(),
+                        rel_vel[0].item(),
+                        rel_vel[1].item(),
+                        rel_acc[0].item(),
+                        rel_acc[1].item(),
+                        0.0,
+                        0.0,
+                    ], device=device)
                     edge_features.append(edge_feat)
                     edge_features.append(edge_feat)
             
@@ -151,10 +218,10 @@ class GraphBuilder:
         # Combine all edges
         if len(all_edge_indices) > 0:
             edge_index = torch.cat(all_edge_indices, dim=1)  # [2, total_edges]
-            edge_features = torch.stack(all_edge_features)  # [total_edges, 3]
+            edge_features = torch.stack(all_edge_features)  # [total_edges, edge_dim]
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-            edge_features = torch.zeros((0, 3), device=device)
+            edge_features = torch.zeros((0, 9), device=device)
         
         # Create ball node features (use ball landing position + zeros for other features)
         ball_features = torch.zeros(batch_size, 1, feature_dim, device=device)
@@ -171,6 +238,7 @@ class GraphBuilder:
         ball_landing: torch.Tensor,
         player_roles: torch.Tensor,
         player_mask: torch.Tensor,
+        continuous_features: torch.Tensor,
     ):
         """
         Build graph in PyTorch Geometric format
@@ -209,11 +277,12 @@ class GraphBuilder:
             x = torch.cat([player_feats, ball_feat], dim=0)  # [num_real_players+1, feature_dim]
             
             # Build edges
-            edge_index, edge_attr, _ = self.build_graph(
-                node_features[b:b+1, :num_real_players],
+        edge_index, edge_attr, _ = self.build_graph(
+            node_features[b:b+1, :num_real_players],
                 ball_landing[b:b+1],
                 player_roles[b:b+1, :num_real_players],
                 player_mask[b:b+1, :num_real_players],
+            continuous_features[b:b+1, :num_real_players],
             )
             
             # Create PyG Data object

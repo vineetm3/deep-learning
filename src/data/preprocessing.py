@@ -106,6 +106,21 @@ class NFLDataPreprocessor:
         df['player_height_inches'] = (df['player_height_inches'] - 60) / 24  # ~5'0" to ~7'0"
         df['player_height_inches'] = df['player_height_inches'].clip(0, 1)
         
+        # Derived kinematic features
+        dir_rad = np.deg2rad(df['dir'])
+        df['vx'] = df['s'] * np.cos(dir_rad)
+        df['vy'] = df['s'] * np.sin(dir_rad)
+        df['ax'] = df['a'] * np.cos(dir_rad)
+        df['ay'] = df['a'] * np.sin(dir_rad)
+        
+        # Ball-relative features
+        df['ball_dx'] = df['ball_land_x'] - df['x']
+        df['ball_dy'] = df['ball_land_y'] - df['y']
+        df['ball_dist'] = np.sqrt(df['ball_dx'] ** 2 + df['ball_dy'] ** 2)
+        ball_angle = np.arctan2(df['ball_dy'], df['ball_dx'])
+        df['ball_angle_sin'] = np.sin(ball_angle)
+        df['ball_angle_cos'] = np.cos(ball_angle)
+        
         # Normalize numerical features
         df = self.normalize_features(df)
         

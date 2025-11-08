@@ -6,9 +6,12 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional
 
+from torch.nn.utils.rnn import pack_padded_sequence
+
 from src.models.graph_builder import GraphBuilder
 from src.models.gat_encoder import GATEncoder
 from src.models.lstm_decoder import RoleConditionedLSTMDecoder
+from src.data.dataset import INPUT_FEATURE_COLUMNS, FEATURE_INDEX
 
 
 class GNNLSTMTrajectoryPredictor(nn.Module):
@@ -32,8 +35,8 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
         self.config = config
         
         # Input feature processing
-        # Continuous features: x, y, s, a, dir, o, height, weight, dist_to_ball (9 features)
-        self.num_continuous_features = 9
+        self.num_continuous_features = len(INPUT_FEATURE_COLUMNS)
+        self.temporal_hidden_dim = getattr(config, 'temporal_hidden_dim', config.gnn_hidden_dim)
         
         # Categorical features will be embedded
         self.role_embedding = nn.Embedding(config.num_roles, config.role_embedding_dim)
@@ -41,9 +44,19 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
         self.side_embedding = nn.Embedding(2, 8)  # Offense/Defense
         self.direction_embedding = nn.Embedding(2, 8)  # Left/Right
         
+        # Temporal encoder for pre-pass sequence
+        self.temporal_encoder = nn.LSTM(
+            input_size=self.num_continuous_features,
+            hidden_size=self.temporal_hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.temporal_dropout = nn.Dropout(config.gnn_dropout)
+        
         # Total node feature dimension after embedding
         total_feature_dim = (
             self.num_continuous_features +
+            self.temporal_hidden_dim +
             config.role_embedding_dim +
             config.position_embedding_dim +
             8 + 8  # side + direction
@@ -63,7 +76,7 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
             num_layers=config.gnn_num_layers,
             num_heads=config.gnn_num_heads,
             dropout=config.gnn_dropout,
-            edge_features=3,  # distance, rel_x, rel_y
+            edge_features=9,  # extended relational features
         )
         
         # LSTM decoder
@@ -107,17 +120,31 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
         player_roles = batch['player_roles']  # [batch, players]
         player_mask = batch['player_mask']  # [batch, players]
         output_mask = batch['output_mask']  # [batch, players, output_frames]
+        input_mask = batch['input_mask']  # [batch, players, frames]
         
         batch_size, num_players, input_frames, _ = input_features.shape
         _, _, max_output_frames = output_mask.shape
         
         # Get last observed positions (for initial decoder input)
-        last_positions = input_features[:, :, -1, :2]  # [batch, players, 2]
+        last_frame = input_features[:, :, -1, :]
+        last_positions = last_frame[:, :, [FEATURE_INDEX['x'], FEATURE_INDEX['y']]]  # [batch, players, 2]
         
         # Average input features across time (simple temporal aggregation)
         # Alternatively, could use last frame or LSTM over frames
         # For now: use last frame for node features
-        node_features_continuous = input_features[:, :, -1, :]  # [batch, players, 9]
+        node_features_continuous = last_frame  # [batch, players, num_features]
+        
+        # Temporal encoding using LSTM over pre-pass frames
+        flat_sequences = input_features.view(batch_size * num_players, input_frames, -1)
+        flat_mask = input_mask.view(batch_size * num_players, input_frames)
+        lengths = flat_mask.sum(dim=1)
+        lengths_clamped = torch.where(lengths > 0, lengths, torch.ones_like(lengths))
+        packed = pack_padded_sequence(flat_sequences, lengths_clamped.cpu(), batch_first=True, enforce_sorted=False)
+        _, (temporal_hidden, _) = self.temporal_encoder(packed)
+        temporal_context = temporal_hidden[-1]  # [batch*players, hidden]
+        temporal_context[lengths == 0] = 0
+        temporal_context = temporal_context.view(batch_size, num_players, self.temporal_hidden_dim)
+        temporal_context = self.temporal_dropout(temporal_context)
         
         # Embed categorical features
         role_embeds = self.role_embedding(categorical_features[:, :, 0])  # Role
@@ -128,6 +155,7 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
         # Concatenate all features
         node_features = torch.cat([
             node_features_continuous,
+            temporal_context,
             role_embeds,
             position_embeds,
             side_embeds,
@@ -143,6 +171,7 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
             ball_landing,
             player_roles,
             player_mask,
+            node_features_continuous,
         )
         
         # Flatten batch for GNN processing
@@ -192,14 +221,23 @@ class SimplifiedGNNLSTM(nn.Module):
         super().__init__()
         
         self.config = config
+        self.num_continuous_features = len(INPUT_FEATURE_COLUMNS)
+        self.temporal_hidden_dim = getattr(config, 'temporal_hidden_dim', config.gnn_hidden_dim)
         
         # Simple feature encoder
-        input_dim = 9 + 4 * 16  # continuous + categorical embeddings
+        input_dim = self.num_continuous_features + self.temporal_hidden_dim + 4 * 16  # continuous + temporal + categorical embeddings
         
         self.role_embedding = nn.Embedding(config.num_roles, 16)
         self.position_embedding = nn.Embedding(config.num_positions, 16)
         self.side_embedding = nn.Embedding(2, 16)
         self.direction_embedding = nn.Embedding(2, 16)
+        self.temporal_encoder = nn.LSTM(
+            input_size=self.num_continuous_features,
+            hidden_size=self.temporal_hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.temporal_dropout = nn.Dropout(config.gnn_dropout)
         
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, config.gnn_hidden_dim),
@@ -232,13 +270,26 @@ class SimplifiedGNNLSTM(nn.Module):
         ball_landing = batch['ball_landing']
         player_roles = batch['player_roles']
         output_mask = batch['output_mask']
+        input_mask = batch['input_mask']
         
         batch_size, num_players, input_frames, _ = input_features.shape
         max_output_frames = output_mask.shape[2]
         
         # Use last frame
         node_features_continuous = input_features[:, :, -1, :]
-        last_positions = input_features[:, :, -1, :2]
+        last_positions = node_features_continuous[:, :, [FEATURE_INDEX['x'], FEATURE_INDEX['y']]]
+        
+        # Temporal encoding
+        flat_sequences = input_features.view(batch_size * num_players, input_frames, -1)
+        flat_mask = input_mask.view(batch_size * num_players, input_frames)
+        lengths = flat_mask.sum(dim=1)
+        lengths_clamped = torch.where(lengths > 0, lengths, torch.ones_like(lengths))
+        packed = pack_padded_sequence(flat_sequences, lengths_clamped.cpu(), batch_first=True, enforce_sorted=False)
+        _, (temporal_hidden, _) = self.temporal_encoder(packed)
+        temporal_context = temporal_hidden[-1]
+        temporal_context[lengths == 0] = 0
+        temporal_context = temporal_context.view(batch_size, num_players, self.temporal_hidden_dim)
+        temporal_context = self.temporal_dropout(temporal_context)
         
         # Embed categoricals
         role_embeds = self.role_embedding(categorical_features[:, :, 0])
@@ -249,6 +300,7 @@ class SimplifiedGNNLSTM(nn.Module):
         # Concatenate
         node_features = torch.cat([
             node_features_continuous,
+            temporal_context,
             role_embeds,
             position_embeds,
             side_embeds,
