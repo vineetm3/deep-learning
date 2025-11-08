@@ -58,14 +58,12 @@ class NFLDataPreprocessor:
             .astype(int)
         )
         
-        # Position - extend mapping dynamically for unseen positions
-        unknown_positions = df.loc[~df['player_position'].isin(self.position_to_idx.keys()), 'player_position'].unique()
-        for pos in unknown_positions:
-            self.position_to_idx[pos] = len(self.position_to_idx)
+        # Position - map to known index, fallback to 0 if unseen
+        default_position_idx = 0
         df['player_position_idx'] = (
             df['player_position']
             .map(self.position_to_idx)
-            .fillna(0)
+            .fillna(default_position_idx)
             .astype(int)
         )
         
