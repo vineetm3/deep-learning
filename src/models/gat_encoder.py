@@ -121,17 +121,20 @@ class GATLayer(nn.Module):
         
         # Normalize attention coefficients using softmax
         # For each target node, normalize over all incoming edges
-        attention = torch.zeros(edge_index[1].max().item() + 1, edge_index.size(1), self.num_heads, device=x.device)
-        attention = attention.index_add_(0, edge_tgt, e)
+        # Compute softmax per target node using scatter operations
+        # Shift by max for numerical stability
+        scatter_idx = edge_tgt.unsqueeze(1).expand(-1, self.num_heads)  # [num_edges, num_heads]
         
-        # Compute softmax per target node
-        e_exp = torch.exp(e - e.max())  # Numerical stability
+        # Compute max for each target node
+        e_max = torch.full((num_nodes, self.num_heads), float('-inf'), device=x.device)
+        e_max.scatter_reduce_(0, scatter_idx, e, reduce='amax', include_self=False)
+        e_normalized = e - e_max[edge_tgt]
         
-        # Sum of exponentials for each target node
+        # Exponentiate and compute sum per target node
+        e_exp = torch.exp(e_normalized)
         e_exp_sum = torch.zeros(num_nodes, self.num_heads, device=x.device)
-        e_exp_sum = e_exp_sum.index_add_(0, edge_tgt, e_exp)
+        e_exp_sum.scatter_reduce_(0, scatter_idx, e_exp, reduce='sum', include_self=False)
         
-        # Normalize
         alpha = e_exp / (e_exp_sum[edge_tgt] + 1e-16)  # [num_edges, num_heads]
         alpha = self.dropout_layer(alpha)
         
