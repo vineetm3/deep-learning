@@ -124,8 +124,6 @@ class GraphBuilder:
                 ], device=device)
                 edge_features.append(rel_features)
                 edge_features.append(rel_features)
-                edge_features.append(edge_feat)
-                edge_features.append(edge_feat)  # Same for both directions
             
             # 2. K-nearest neighbor edges
             if num_real_players > 1:
