@@ -23,7 +23,7 @@ def load_trained_model(checkpoint_path: str, config, device: str = 'cpu', simple
         model = GNNLSTMTrajectoryPredictor(config.model)
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
