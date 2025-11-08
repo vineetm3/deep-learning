@@ -276,14 +276,16 @@ class GraphBuilder:
             # Combine nodes
             x = torch.cat([player_feats, ball_feat], dim=0)  # [num_real_players+1, feature_dim]
             
-            # Build edges
-        edge_index, edge_attr, _ = self.build_graph(
-            node_features[b:b+1, :num_real_players],
+            # Build edges for this play
+            edge_index, edge_attr, _ = self.build_graph(
+                node_features[b:b+1, :num_real_players],
                 ball_landing[b:b+1],
                 player_roles[b:b+1, :num_real_players],
                 player_mask[b:b+1, :num_real_players],
-            continuous_features[b:b+1, :num_real_players],
+                continuous_features[b:b+1, :num_real_players],
             )
+            # Remove batch offset (since build_graph assumes full batch)
+            edge_index = edge_index - edge_index.min()
             
             # Create PyG Data object
             data = Data(
