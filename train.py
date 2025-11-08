@@ -64,6 +64,11 @@ def main(args):
     train_input, _ = load_multiple_weeks(config.data.train_dir, config.data.train_weeks)
     preprocessor.fit_categorical_mappings(train_input)
     
+    # Ensure model config has enough capacity for learned vocab sizes
+    num_positions = len(preprocessor.position_to_idx)
+    if num_positions > config.model.num_positions:
+        config.model.num_positions = num_positions
+    
     # Save preprocessor
     preprocessor_path = Path("checkpoints") / "preprocessor.pkl"
     preprocessor_path.parent.mkdir(exist_ok=True, parents=True)
