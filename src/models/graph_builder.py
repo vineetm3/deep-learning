@@ -13,6 +13,8 @@ IDX_VX = FEATURE_INDEX.get('vx')
 IDX_VY = FEATURE_INDEX.get('vy')
 IDX_AX = FEATURE_INDEX.get('ax')
 IDX_AY = FEATURE_INDEX.get('ay')
+IDX_BALL_SIN = FEATURE_INDEX.get('ball_angle_sin')
+IDX_BALL_COS = FEATURE_INDEX.get('ball_angle_cos')
 
 
 class GraphBuilder:
