@@ -13,6 +13,7 @@ import numpy as np
 from typing import Dict, Optional
 
 from src.evaluation.metrics import MetricsTracker
+from src.data.dataset import FEATURE_INDEX
 
 
 class Trainer:
@@ -26,6 +27,7 @@ class Trainer:
         criterion: nn.Module,
         config,
         device: str = 'cuda',
+        norm_ranges: Optional[Dict[str, tuple]] = None,
     ):
         """
         Args:
@@ -42,6 +44,9 @@ class Trainer:
         self.criterion = criterion
         self.config = config
         self.device = device
+        self.norm_ranges = norm_ranges
+        self.use_mirroring = getattr(config, 'use_left_right_mirroring', False)
+        self.mirror_probability = getattr(config, 'mirror_probability', 0.0)
         
         # Optimizer
         self.optimizer = optim.Adam(
@@ -115,6 +120,7 @@ class Trainer:
         for batch in pbar:
             # Move batch to device
             batch = self._move_batch_to_device(batch)
+            self._maybe_apply_mirroring(batch)
             
             # Forward pass
             self.optimizer.zero_grad()
@@ -124,13 +130,18 @@ class Trainer:
                 teacher_forcing_ratio=teacher_forcing_ratio,
             )
             
-            # Compute loss
-            loss = self.criterion(
-                predictions,
-                batch['output_positions'],
-                batch['player_roles'],
-                batch['output_mask'],
-            )
+        # Compute residual targets
+        last_positions = self._get_last_positions(batch)
+        target_residuals = self._compute_residual_sequences(batch['output_positions'], last_positions)
+        pred_residuals = self._compute_residual_sequences(predictions, last_positions)
+        
+        # Compute loss on residuals
+        loss = self.criterion(
+            pred_residuals,
+            target_residuals,
+            batch['player_roles'],
+            batch['output_mask'],
+        )
             
             # Backward pass
             loss.backward()
@@ -183,10 +194,14 @@ class Trainer:
                 # Forward pass (no teacher forcing during validation)
                 predictions = self.model(batch, teacher_forcing_ratio=0.0)
                 
+                last_positions = self._get_last_positions(batch)
+                target_residuals = self._compute_residual_sequences(batch['output_positions'], last_positions)
+                pred_residuals = self._compute_residual_sequences(predictions, last_positions)
+                
                 # Compute loss
                 loss = self.criterion(
-                    predictions,
-                    batch['output_positions'],
+                    pred_residuals,
+                    target_residuals,
                     batch['player_roles'],
                     batch['output_mask'],
                 )
@@ -305,5 +320,96 @@ class Trainer:
             else:
                 device_batch[key] = value
         return device_batch
+
+    def _get_last_positions(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Extract last observed positions (x, y) prior to the throw."""
+        positions = batch['input_features'][..., [FEATURE_INDEX['x'], FEATURE_INDEX['y']]]
+        mask = batch['input_mask'].bool()
+        last_positions = torch.zeros(
+            positions.size(0),
+            positions.size(1),
+            2,
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+        for t in range(positions.size(2)):
+            update_mask = mask[:, :, t].unsqueeze(-1)
+            last_positions = torch.where(update_mask, positions[:, :, t], last_positions)
+        return last_positions
+
+    def _compute_residual_sequences(self, positions: torch.Tensor, last_positions: torch.Tensor) -> torch.Tensor:
+        """Compute Δ positions relative to previous timestep (first step relative to last observed)."""
+        prev_positions = torch.cat([last_positions.unsqueeze(2), positions[:, :, :-1]], dim=2)
+        residuals = positions - prev_positions
+        return residuals
+
+    def _maybe_apply_mirroring(self, batch: Dict[str, torch.Tensor]):
+        """Randomly mirror plays left/right to augment training data."""
+        if not self.use_mirroring or self.norm_ranges is None or self.mirror_probability <= 0.0:
+            return
+        if torch.rand(1, device=self.device).item() > self.mirror_probability:
+            return
+        self._mirror_batch_inplace(batch)
+
+    def _mirror_batch_inplace(self, batch: Dict[str, torch.Tensor]):
+        """Mirror all tensors in batch across the field width."""
+        input_features = batch['input_features']
+        output_positions = batch['output_positions']
+        ball_landing = batch['ball_landing']
+        categorical = batch['categorical_features']
+
+        # Mirror positional coordinates
+        input_features[..., FEATURE_INDEX['y']] = self._mirror_feature(input_features[..., FEATURE_INDEX['y']], 'y')
+        input_features[..., FEATURE_INDEX['ball_land_y']] = self._mirror_feature(input_features[..., FEATURE_INDEX['ball_land_y']], 'ball_land_y')
+        output_positions[..., 1] = self._mirror_feature(output_positions[..., 1], 'y')
+        ball_landing[..., 1] = self._mirror_feature(ball_landing[..., 1], 'ball_land_y')
+
+        # Flip velocity/acceleration components in Y
+        input_features[..., FEATURE_INDEX['vy']] = self._flip_feature_sign(input_features[..., FEATURE_INDEX['vy']], 'vy')
+        input_features[..., FEATURE_INDEX['ay']] = self._flip_feature_sign(input_features[..., FEATURE_INDEX['ay']], 'ay')
+
+        # Flip ball-relative Y features
+        input_features[..., FEATURE_INDEX['ball_dy']] = self._flip_feature_sign(input_features[..., FEATURE_INDEX['ball_dy']], 'ball_dy')
+        input_features[..., FEATURE_INDEX['ball_angle_sin']] = self._flip_feature_sign(input_features[..., FEATURE_INDEX['ball_angle_sin']], 'ball_angle_sin')
+        input_features[..., FEATURE_INDEX['route_width']] = self._flip_feature_sign(input_features[..., FEATURE_INDEX['route_width']], 'route_width')
+
+        # Mirror directional angles
+        input_features[..., FEATURE_INDEX['dir']] = self._mirror_angle_feature(input_features[..., FEATURE_INDEX['dir']], 'dir')
+        input_features[..., FEATURE_INDEX['o']] = self._mirror_angle_feature(input_features[..., FEATURE_INDEX['o']], 'o')
+
+        # Flip play direction categorical label (0 <-> 1)
+        categorical[:, :, 3] = 1 - categorical[:, :, 3]
+
+    def _mirror_feature(self, values: torch.Tensor, feature_name: str) -> torch.Tensor:
+        """Mirror value across midpoint between min and max."""
+        min_val, max_val = self.norm_ranges[feature_name]
+        min_t = torch.as_tensor(min_val, device=values.device, dtype=values.dtype)
+        max_t = torch.as_tensor(max_val, device=values.device, dtype=values.dtype)
+        real = values * (max_t - min_t) + min_t
+        mirrored = (min_t + max_t) - real
+        normalized = (mirrored - min_t) / (max_t - min_t)
+        return normalized.clamp(0.0, 1.0)
+
+    def _flip_feature_sign(self, values: torch.Tensor, feature_name: str) -> torch.Tensor:
+        """Flip the sign of a feature with symmetric range."""
+        min_val, max_val = self.norm_ranges[feature_name]
+        min_t = torch.as_tensor(min_val, device=values.device, dtype=values.dtype)
+        max_t = torch.as_tensor(max_val, device=values.device, dtype=values.dtype)
+        real = values * (max_t - min_t) + min_t
+        flipped = -real
+        normalized = (flipped - min_t) / (max_t - min_t)
+        return normalized.clamp(0.0, 1.0)
+
+    def _mirror_angle_feature(self, values: torch.Tensor, feature_name: str) -> torch.Tensor:
+        """Mirror directional angle (in degrees) across the vertical axis."""
+        min_val, max_val = self.norm_ranges[feature_name]
+        min_t = torch.as_tensor(min_val, device=values.device, dtype=values.dtype)
+        max_t = torch.as_tensor(max_val, device=values.device, dtype=values.dtype)
+        period = max_t - min_t
+        real = values * period + min_t
+        mirrored = (torch.as_tensor(180.0, device=values.device, dtype=values.dtype) - real + period) % period
+        mirrored = torch.where(mirrored < 0, mirrored + period, mirrored)
+        normalized = (mirrored - min_t) / period
+        return normalized.clamp(0.0, 1.0)
 
 

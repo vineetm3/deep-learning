@@ -121,6 +121,11 @@ class NFLDataPreprocessor:
         df['ball_angle_sin'] = np.sin(ball_angle)
         df['ball_angle_cos'] = np.cos(ball_angle)
         
+        # Advanced feature engineering
+        df = self._add_opponent_features(df)
+        df = self._add_route_features(df)
+        df = self._add_geometric_features(df)
+        
         # Normalize numerical features
         df = self.normalize_features(df)
         
@@ -132,6 +137,116 @@ class NFLDataPreprocessor:
             (df['x'] - df['ball_land_x'])**2 + 
             (df['y'] - df['ball_land_y'])**2
         )
+        
+        return df
+    
+    def _add_opponent_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add nearest opponent distance and pressure-related metrics"""
+        df['nearest_opp_dist'] = 30.0
+        df['near_opp_count_3'] = 0.0
+        df['near_opp_count_5'] = 0.0
+        df['closing_speed'] = 0.0
+        
+        group_cols = ['game_id', 'play_id', 'frame_id']
+        for _, group in df.groupby(group_cols, sort=False):
+            idx = group.index
+            coords = group[['x', 'y']].to_numpy(dtype=np.float32)
+            vx = group['vx'].to_numpy(dtype=np.float32)
+            vy = group['vy'].to_numpy(dtype=np.float32)
+            sides = (group['player_side'] == 'Offense').to_numpy()
+            n = len(group)
+            
+            if n <= 1:
+                continue
+            
+            nearest = np.full(n, 30.0, dtype=np.float32)
+            cnt3 = np.zeros(n, dtype=np.float32)
+            cnt5 = np.zeros(n, dtype=np.float32)
+            closing = np.zeros(n, dtype=np.float32)
+            
+            for i in range(n):
+                mask = np.ones(n, dtype=bool)
+                mask[i] = False
+                opp_mask = mask & (sides != sides[i])
+                if not np.any(opp_mask):
+                    continue
+                diffs = coords[opp_mask] - coords[i]
+                dists = np.linalg.norm(diffs, axis=1)
+                nearest[i] = float(dists.min())
+                cnt3[i] = float((dists < 3.0).sum())
+                cnt5[i] = float((dists < 5.0).sum())
+                opp_indices = np.where(opp_mask)[0]
+                nearest_idx = opp_indices[dists.argmin()]
+                rel_vx = vx[nearest_idx] - vx[i]
+                rel_vy = vy[nearest_idx] - vy[i]
+                unit = (coords[nearest_idx] - coords[i]) / (nearest[i] + 1e-6)
+                closing[i] = float(-(rel_vx * unit[0] + rel_vy * unit[1]))
+            
+            df.loc[idx, 'nearest_opp_dist'] = nearest
+            df.loc[idx, 'near_opp_count_3'] = cnt3
+            df.loc[idx, 'near_opp_count_5'] = cnt5
+            df.loc[idx, 'closing_speed'] = closing
+        
+        return df
+    
+    def _add_route_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add per-player route statistics across the pre-pass window"""
+        df['route_depth'] = 0.0
+        df['route_width'] = 0.0
+        df['route_straightness'] = 0.0
+        df['route_speed_mean'] = 0.0
+        df['route_speed_change'] = 0.0
+        
+        for _, group in df.groupby(['game_id', 'play_id', 'nfl_id'], sort=False):
+            group_sorted = group.sort_values('frame_id')
+            idx = group_sorted.index
+            if len(group_sorted) < 2:
+                df.loc[idx, 'route_speed_mean'] = float(group_sorted['s'].iloc[-1])
+                continue
+            
+            x_vals = group_sorted['x'].to_numpy(dtype=np.float32)
+            y_vals = group_sorted['y'].to_numpy(dtype=np.float32)
+            s_vals = group_sorted['s'].to_numpy(dtype=np.float32)
+            
+            dx = float(x_vals[-1] - x_vals[0])
+            dy = float(y_vals[-1] - y_vals[0])
+            steps = np.sqrt(np.diff(x_vals)**2 + np.diff(y_vals)**2)
+            total_dist = float(steps.sum())
+            displacement = float(np.sqrt(dx**2 + dy**2))
+            straightness = float(displacement / (total_dist + 1e-6))
+            speed_mean = float(s_vals.mean())
+            speed_change = float(s_vals[-1] - s_vals[0])
+            
+            df.loc[idx, 'route_depth'] = dx
+            df.loc[idx, 'route_width'] = dy
+            df.loc[idx, 'route_straightness'] = straightness
+            df.loc[idx, 'route_speed_mean'] = speed_mean
+            df.loc[idx, 'route_speed_change'] = speed_change
+        
+        return df
+    
+    def _add_geometric_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Estimate geometric endpoints and alignment toward the ball"""
+        t_total = (df['num_frames_output'].clip(lower=1).astype(float)) / 10.0
+        geo_endpoint_x = df['x'] + df['vx'] * t_total
+        geo_endpoint_y = df['y'] + df['vy'] * t_total
+        
+        receiver_mask = df['player_role'] == 'Targeted Receiver'
+        geo_endpoint_x = np.where(receiver_mask, df['ball_land_x'], geo_endpoint_x)
+        geo_endpoint_y = np.where(receiver_mask, df['ball_land_y'], geo_endpoint_y)
+        
+        geo_vector_x = geo_endpoint_x - df['x']
+        geo_vector_y = geo_endpoint_y - df['y']
+        geo_distance = np.sqrt(geo_vector_x ** 2 + geo_vector_y ** 2)
+        
+        velocity_mag = np.sqrt(df['vx'] ** 2 + df['vy'] ** 2) + 1e-6
+        geo_alignment = (
+            (df['vx'] * geo_vector_x + df['vy'] * geo_vector_y) /
+            ((geo_distance + 1e-6) * velocity_mag)
+        )
+        
+        df['geo_distance'] = geo_distance
+        df['geo_alignment'] = geo_alignment
         
         return df
     

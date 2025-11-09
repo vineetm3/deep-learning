@@ -25,8 +25,30 @@ class DataConfig:
     # Feature columns
     position_features: list = field(default_factory=lambda: ['x', 'y'])
     motion_features: list = field(default_factory=lambda: ['s', 'a', 'dir', 'o', 'vx', 'vy', 'ax', 'ay'])
-    static_features: list = field(default_factory=lambda: ['player_weight', 'absolute_yardline_number'])
-    ball_features: list = field(default_factory=lambda: ['ball_land_x', 'ball_land_y', 'ball_dx', 'ball_dy', 'ball_dist', 'ball_angle_sin', 'ball_angle_cos'])
+    static_features: list = field(default_factory=lambda: [
+        'player_weight',
+        'absolute_yardline_number',
+        'nearest_opp_dist',
+        'near_opp_count_3',
+        'near_opp_count_5',
+        'closing_speed',
+        'route_depth',
+        'route_width',
+        'route_straightness',
+        'route_speed_mean',
+        'route_speed_change',
+        'geo_distance',
+        'geo_alignment',
+    ])
+    ball_features: list = field(default_factory=lambda: [
+        'ball_land_x',
+        'ball_land_y',
+        'ball_dx',
+        'ball_dy',
+        'ball_dist',
+        'ball_angle_sin',
+        'ball_angle_cos',
+    ])
     
     # Categorical features
     categorical_features: list = field(default_factory=lambda: ['player_role', 'player_position', 'player_side', 'play_direction'])
@@ -51,6 +73,15 @@ class DataConfig:
         'vy': (-15.0, 15.0),
         'ax': (-20.0, 20.0),
         'ay': (-20.0, 20.0),
+        'nearest_opp_dist': (0.0, 40.0),
+        'near_opp_count_3': (0.0, 11.0),
+        'near_opp_count_5': (0.0, 11.0),
+        'closing_speed': (-20.0, 20.0),
+        'route_depth': (-60.0, 60.0),
+        'route_width': (-30.0, 30.0),
+        'route_straightness': (0.0, 1.0),
+        'route_speed_mean': (0.0, 15.0),
+        'route_speed_change': (-10.0, 10.0),
         'ball_land_x': (0.0, 120.0),
         'ball_land_y': (-10.0, 60.0),  # Can be out of bounds
         'ball_dx': (-60.0, 60.0),
@@ -60,6 +91,8 @@ class DataConfig:
         'ball_angle_cos': (-1.0, 1.0),
         'player_weight': (150.0, 350.0),
         'absolute_yardline_number': (0.0, 100.0),
+        'geo_distance': (0.0, 70.0),
+        'geo_alignment': (-1.0, 1.0),
     })
     
     def __post_init__(self):
@@ -86,6 +119,12 @@ class ModelConfig:
     lstm_hidden_dim: int = 256
     lstm_num_layers: int = 2
     lstm_dropout: float = 0.35
+    
+    # Transformer decoder configuration
+    decoder_embed_dim: int = 256
+    decoder_num_layers: int = 4
+    decoder_num_heads: int = 8
+    decoder_dropout: float = 0.2
     
     # Role embeddings
     role_embedding_dim: int = 16
@@ -125,6 +164,15 @@ class TrainingConfig:
         'Other Route Runner': 1.0,
         'Passer': 1.0,
     })
+    receiver_aux_weight: float = 0.2
+    coverage_aux_weight: float = 0.3
+    coverage_focus_window: int = 5
+    late_timestep_gamma: float = 1.5
+    late_timestep_max: float = 2.0
+    velocity_weight: float = 0.0
+    collision_weight: float = 0.0
+    use_left_right_mirroring: bool = True
+    mirror_probability: float = 0.5
     
     # Learning rate scheduling
     lr_scheduler: str = "cosine"  # "reduce_on_plateau" or "cosine"

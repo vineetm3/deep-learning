@@ -1,16 +1,16 @@
 """
-Complete GNN-LSTM model for NFL trajectory prediction
+Complete GNN-Transformer model for NFL trajectory prediction
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+from typing import Dict
 
 from torch.nn.utils.rnn import pack_padded_sequence
 
 from src.models.graph_builder import GraphBuilder
 from src.models.gat_encoder import GATEncoder
-from src.models.lstm_decoder import RoleConditionedLSTMDecoder
+from src.models.transformer_decoder import TransformerTrajectoryDecoder
 from src.data.dataset import INPUT_FEATURE_COLUMNS, FEATURE_INDEX
 
 
@@ -79,15 +79,15 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
             edge_features=9,  # extended relational features
         )
         
-        # LSTM decoder
-        self.lstm_decoder = RoleConditionedLSTMDecoder(
+        # Transformer decoder
+        self.decoder = TransformerTrajectoryDecoder(
             context_dim=config.gnn_output_dim,
-            role_embedding_dim=config.role_embedding_dim,
-            num_roles=config.num_roles,
-            hidden_dim=config.lstm_hidden_dim,
-            num_layers=config.lstm_num_layers,
-            dropout=config.lstm_dropout,
-            output_dim=config.output_dim,
+            role_dim=config.role_embedding_dim,
+            embed_dim=config.decoder_embed_dim,
+            num_steps=config.max_output_frames,
+            num_layers=config.decoder_num_layers,
+            num_heads=config.decoder_num_heads,
+            dropout=config.decoder_dropout,
         )
     
     def forward(
@@ -118,8 +118,8 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
         categorical_features = batch['categorical_features']  # [batch, players, 4]
         ball_landing = batch['ball_landing']  # [batch, 2]
         player_roles = batch['player_roles']  # [batch, players]
-        player_mask = batch['player_mask']  # [batch, players]
-        output_mask = batch['output_mask']  # [batch, players, output_frames]
+        player_mask = batch['player_mask'].to(input_features.dtype)  # [batch, players]
+        output_mask = batch['output_mask'].to(input_features.dtype)  # [batch, players, output_frames]
         input_mask = batch['input_mask']  # [batch, players, frames]
         
         batch_size, num_players, input_frames, _ = input_features.shape
@@ -194,18 +194,18 @@ class GNNLSTMTrajectoryPredictor(nn.Module):
         # Extract player embeddings (exclude ball node)
         player_embeddings = node_embeddings[:, :num_players, :]  # [batch, players, gnn_output_dim]
         
-        # Decode trajectories
-        ground_truth = batch.get('output_positions', None)
-        
-        predictions = self.lstm_decoder(
+        # Decode trajectories with transformer
+        mask = output_mask * player_mask.unsqueeze(-1)
+        residuals = self.decoder(
             context=player_embeddings,
-            initial_position=last_positions,
+            role_embed=role_embeds,
             ball_landing=ball_landing,
-            roles=player_roles,
-            max_steps=max_output_frames,
-            ground_truth=ground_truth,
-            teacher_forcing_ratio=teacher_forcing_ratio,
+            mask=mask,
         )
+        residuals = residuals * mask.unsqueeze(-1)
+        residuals_cumsum = residuals.cumsum(dim=2)
+        predictions = last_positions.unsqueeze(2) + residuals_cumsum
+        predictions = predictions * mask.unsqueeze(-1) + last_positions.unsqueeze(2) * (1 - mask.unsqueeze(-1))
         
         return predictions
 
@@ -225,12 +225,18 @@ class SimplifiedGNNLSTM(nn.Module):
         self.temporal_hidden_dim = getattr(config, 'temporal_hidden_dim', config.gnn_hidden_dim)
         
         # Simple feature encoder
-        input_dim = self.num_continuous_features + self.temporal_hidden_dim + 4 * 16  # continuous + temporal + categorical embeddings
+        cat_dim = (
+            config.role_embedding_dim +
+            config.position_embedding_dim +
+            8 +
+            8
+        )
+        input_dim = self.num_continuous_features + self.temporal_hidden_dim + cat_dim
         
-        self.role_embedding = nn.Embedding(config.num_roles, 16)
-        self.position_embedding = nn.Embedding(config.num_positions, 16)
-        self.side_embedding = nn.Embedding(2, 16)
-        self.direction_embedding = nn.Embedding(2, 16)
+        self.role_embedding = nn.Embedding(config.num_roles, config.role_embedding_dim)
+        self.position_embedding = nn.Embedding(config.num_positions, config.position_embedding_dim)
+        self.side_embedding = nn.Embedding(2, 8)
+        self.direction_embedding = nn.Embedding(2, 8)
         self.temporal_encoder = nn.LSTM(
             input_size=self.num_continuous_features,
             hidden_size=self.temporal_hidden_dim,
@@ -247,15 +253,15 @@ class SimplifiedGNNLSTM(nn.Module):
             nn.ReLU(),
         )
         
-        # LSTM decoder
-        self.lstm_decoder = RoleConditionedLSTMDecoder(
+        # Transformer decoder
+        self.decoder = TransformerTrajectoryDecoder(
             context_dim=config.gnn_output_dim,
-            role_embedding_dim=config.role_embedding_dim,
-            num_roles=config.num_roles,
-            hidden_dim=config.lstm_hidden_dim,
-            num_layers=config.lstm_num_layers,
-            dropout=config.lstm_dropout,
-            output_dim=config.output_dim,
+            role_dim=config.role_embedding_dim,
+            embed_dim=config.decoder_embed_dim,
+            num_steps=config.max_output_frames,
+            num_layers=config.decoder_num_layers,
+            num_heads=config.decoder_num_heads,
+            dropout=config.decoder_dropout,
         )
     
     def forward(
@@ -269,6 +275,8 @@ class SimplifiedGNNLSTM(nn.Module):
         categorical_features = batch['categorical_features']
         ball_landing = batch['ball_landing']
         player_roles = batch['player_roles']
+        player_mask = batch.get('player_mask', torch.ones_like(player_roles, dtype=input_features.dtype)).to(input_features.dtype)
+        output_mask = output_mask.to(input_features.dtype)
         output_mask = batch['output_mask']
         input_mask = batch['input_mask']
         
@@ -310,18 +318,18 @@ class SimplifiedGNNLSTM(nn.Module):
         # Encode
         embeddings = self.encoder(node_features)
         
-        # Decode
-        ground_truth = batch.get('output_positions', None)
-        
-        predictions = self.lstm_decoder(
+        # Decode with transformer
+        mask = output_mask * player_mask.unsqueeze(-1)
+        residuals = self.decoder(
             context=embeddings,
-            initial_position=last_positions,
+            role_embed=role_embeds,
             ball_landing=ball_landing,
-            roles=player_roles,
-            max_steps=max_output_frames,
-            ground_truth=ground_truth,
-            teacher_forcing_ratio=teacher_forcing_ratio,
+            mask=mask,
         )
+        residuals = residuals * mask.unsqueeze(-1)
+        residuals_cumsum = residuals.cumsum(dim=2)
+        predictions = last_positions.unsqueeze(2) + residuals_cumsum
+        predictions = predictions * mask.unsqueeze(-1) + last_positions.unsqueeze(2) * (1 - mask.unsqueeze(-1))
         
         return predictions
 

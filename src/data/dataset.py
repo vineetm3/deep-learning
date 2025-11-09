@@ -30,6 +30,17 @@ INPUT_FEATURE_COLUMNS = [
     'ball_dist',
     'ball_angle_sin',
     'ball_angle_cos',
+    'nearest_opp_dist',
+    'near_opp_count_3',
+    'near_opp_count_5',
+    'closing_speed',
+    'route_depth',
+    'route_width',
+    'route_straightness',
+    'route_speed_mean',
+    'route_speed_change',
+    'geo_distance',
+    'geo_alignment',
 ]
 FEATURE_INDEX = {name: idx for idx, name in enumerate(INPUT_FEATURE_COLUMNS)}
 
@@ -172,6 +183,7 @@ class NFLTrajectoryDataset(Dataset):
             'num_output_frames': num_output_frames,
             'game_id': game_id,
             'play_id': play_id,
+            'player_ids': torch.LongTensor(player_ids),
         }
 
 
@@ -205,6 +217,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'num_output_frames': [],
         'game_ids': [],
         'play_ids': [],
+        'player_ids': [],
     }
     
     # Fill in data
@@ -224,6 +237,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         batched['num_output_frames'].append(sample['num_output_frames'])
         batched['game_ids'].append(sample['game_id'])
         batched['play_ids'].append(sample['play_id'])
+        batched['player_ids'].append(sample['player_ids'][:n_players].tolist())
     
     return batched
 

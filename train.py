@@ -12,7 +12,7 @@ from src.utils.config import get_config
 from src.data.preprocessing import NFLDataPreprocessor, load_multiple_weeks
 from src.data.dataset import create_dataloaders
 from src.models.gnn_lstm import GNNLSTMTrajectoryPredictor, SimplifiedGNNLSTM
-from src.training.losses import WeightedMSELoss
+from src.training.losses import TrajectoryLoss
 from src.training.trainer import Trainer
 
 
@@ -104,7 +104,16 @@ def main(args):
     print(f"Number of parameters: {num_params:,}")
     
     # Create loss function
-    criterion = WeightedMSELoss(config.training.role_weights)
+    criterion = TrajectoryLoss(
+        role_weights=config.training.role_weights,
+        velocity_weight=config.training.velocity_weight,
+        collision_weight=config.training.collision_weight,
+        late_timestep_gamma=config.training.late_timestep_gamma,
+        late_timestep_max=config.training.late_timestep_max,
+        receiver_aux_weight=config.training.receiver_aux_weight,
+        coverage_aux_weight=config.training.coverage_aux_weight,
+        coverage_window=config.training.coverage_focus_window,
+    )
     
     # Create trainer
     print("\n" + "="*80)
@@ -118,6 +127,7 @@ def main(args):
         criterion=criterion,
         config=config.training,
         device=device,
+        norm_ranges=config.data.norm_ranges,
     )
     
     # Train
