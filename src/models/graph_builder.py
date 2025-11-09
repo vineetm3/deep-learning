@@ -25,13 +25,17 @@ class GraphBuilder:
     - Edges: player-to-ball, k-nearest neighbors, role-specific
     """
     
+    FIELD_LENGTH = 120.0
+    MAX_SPEED = 15.0
+    MAX_ACCEL = 20.0
+
     def __init__(self, k_neighbors: int = 5):
         """
         Args:
             k_neighbors: Number of nearest neighbors for each player
         """
         self.k_neighbors = k_neighbors
-        self.edge_feature_dim = 9
+        self.edge_feature_dim = 11
         self.eps = 1e-6
 
     def _get_vector(
@@ -57,32 +61,39 @@ class GraphBuilder:
         tgt_acc: torch.Tensor,
     ) -> torch.Tensor:
         rel_vec = tgt_pos - src_pos  # [N, 2]
-        dist = torch.norm(rel_vec, dim=-1, keepdim=True).clamp(min=self.eps)
-        rel_dir = rel_vec / dist
+        dist = torch.norm(rel_vec, dim=-1, keepdim=True)
+        rel_dir = rel_vec / (dist + self.eps)
+        dist_norm = torch.clamp(dist / self.FIELD_LENGTH, 0.0, 1.0)
 
         rel_vel = tgt_vel - src_vel
         speed_along = (rel_vel * rel_dir).sum(dim=-1, keepdim=True)
         speed_mag = torch.norm(rel_vel, dim=-1, keepdim=True)
+        speed_along_norm = torch.clamp(speed_along / self.MAX_SPEED, -1.0, 1.0)
+        speed_mag_norm = torch.clamp(speed_mag / self.MAX_SPEED, 0.0, 1.0)
 
         rel_acc = tgt_acc - src_acc
         acc_along = (rel_acc * rel_dir).sum(dim=-1, keepdim=True)
         acc_mag = torch.norm(rel_acc, dim=-1, keepdim=True)
+        acc_along_norm = torch.clamp(acc_along / self.MAX_ACCEL, -1.0, 1.0)
+        acc_mag_norm = torch.clamp(acc_mag / self.MAX_ACCEL, 0.0, 1.0)
 
         src_speed = torch.norm(src_vel, dim=-1, keepdim=True)
-        heading_alignment = ( (src_vel / (src_speed + self.eps)) * rel_dir ).sum(dim=-1, keepdim=True)
+        heading_alignment = (
+            (src_vel / (src_speed + self.eps)) * rel_dir
+        ).sum(dim=-1, keepdim=True)
         heading_alignment = torch.clamp(heading_alignment, -1.0, 1.0)
 
-        time_to_target = dist / (speed_mag + self.eps)
+        time_decay = torch.exp(-dist_norm / (speed_mag_norm + self.eps))
 
         features = torch.cat([
-            dist,
+            dist_norm,
             rel_dir,
-            speed_along,
-            speed_mag,
-            acc_along,
-            acc_mag,
+            speed_along_norm,
+            speed_mag_norm,
+            acc_along_norm,
+            acc_mag_norm,
             heading_alignment,
-            time_to_target,
+            time_decay,
         ], dim=-1)
 
         return features
@@ -130,6 +141,17 @@ class GraphBuilder:
             player_positions = player_continuous[:, [IDX_X, IDX_Y]]
             player_velocities = self._get_vector(player_continuous, IDX_VX, IDX_VY)
             player_accelerations = self._get_vector(player_continuous, IDX_AX, IDX_AY)
+            ball_angle_sin = (
+                player_continuous[:, IDX_BALL_SIN].unsqueeze(-1)
+                if IDX_BALL_SIN is not None and IDX_BALL_SIN < player_continuous.size(-1)
+                else torch.zeros(num_real_players, 1, device=device)
+            )
+            ball_angle_cos = (
+                player_continuous[:, IDX_BALL_COS].unsqueeze(-1)
+                if IDX_BALL_COS is not None and IDX_BALL_COS < player_continuous.size(-1)
+                else torch.zeros(num_real_players, 1, device=device)
+            )
+            ball_angle_feats = torch.cat([ball_angle_sin, ball_angle_cos], dim=-1)
 
             ball_position = ball_landing[b].unsqueeze(0)
             ball_repeated = ball_position.expand(num_real_players, -1)
@@ -150,6 +172,7 @@ class GraphBuilder:
                 player_accelerations,
                 ball_zero,
             )
+            pb_features = torch.cat([pb_features, ball_angle_feats], dim=-1)
             edge_pb = torch.stack([player_indices, ball_node_idx], dim=0)
             edge_chunks.append(edge_pb)
             feature_chunks.append(pb_features)
@@ -163,6 +186,7 @@ class GraphBuilder:
                 ball_zero,
                 player_accelerations,
             )
+            bp_features = torch.cat([bp_features, ball_angle_feats], dim=-1)
             edge_bp = torch.stack([ball_node_idx, player_indices], dim=0)
             edge_chunks.append(edge_bp)
             feature_chunks.append(bp_features)
@@ -185,11 +209,19 @@ class GraphBuilder:
                 tgt_acc = player_accelerations[tgt_idx]
 
                 features_knn = self._pairwise_features(src_pos, tgt_pos, src_vel, tgt_vel, src_acc, tgt_acc)
+                features_knn = torch.cat([
+                    features_knn,
+                    torch.zeros(features_knn.size(0), 2, device=device),
+                ], dim=-1)
                 edges_knn = torch.stack([src_idx, tgt_idx], dim=0)
                 edge_chunks.append(edges_knn)
                 feature_chunks.append(features_knn)
 
                 features_knn_rev = self._pairwise_features(tgt_pos, src_pos, tgt_vel, src_vel, tgt_acc, src_acc)
+                features_knn_rev = torch.cat([
+                    features_knn_rev,
+                    torch.zeros(features_knn_rev.size(0), 2, device=device),
+                ], dim=-1)
                 edges_knn_rev = torch.stack([tgt_idx, src_idx], dim=0)
                 edge_chunks.append(edges_knn_rev)
                 feature_chunks.append(features_knn_rev)
@@ -212,6 +244,10 @@ class GraphBuilder:
                     player_accelerations[coverage_idx],
                     player_accelerations[target_rep],
                 )
+                cov_features = torch.cat([
+                    cov_features,
+                    torch.zeros(cov_features.size(0), 2, device=device),
+                ], dim=-1)
                 cov_edges = torch.stack([coverage_idx, target_rep], dim=0)
                 edge_chunks.append(cov_edges)
                 feature_chunks.append(cov_features)
@@ -224,6 +260,10 @@ class GraphBuilder:
                     player_accelerations[target_rep],
                     player_accelerations[coverage_idx],
                 )
+                rec_features = torch.cat([
+                    rec_features,
+                    torch.zeros(rec_features.size(0), 2, device=device),
+                ], dim=-1)
                 rec_edges = torch.stack([target_rep, coverage_idx], dim=0)
                 edge_chunks.append(rec_edges)
                 feature_chunks.append(rec_features)
