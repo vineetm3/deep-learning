@@ -12,6 +12,7 @@ class DataConfig:
     # Paths
     data_dir: Path = Path("nfl-big-data-bowl-2026-prediction")
     train_dir: Path = field(init=False)
+    preprocessing_workers: int = 1
     
     # Week splits
     train_weeks: list = field(default_factory=lambda: list(range(1, 15)))  # Weeks 1-14

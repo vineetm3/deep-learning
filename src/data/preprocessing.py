@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
+from joblib import Parallel, delayed
 import pickle
 
 
@@ -22,6 +23,7 @@ class NFLDataPreprocessor:
         self.position_to_idx = {}
         self.side_to_idx = {'Offense': 0, 'Defense': 1}
         self.direction_to_idx = {'left': 0, 'right': 1}
+        self.num_workers = max(1, getattr(config, 'preprocessing_workers', 1))
         
     def fit_categorical_mappings(self, df: pd.DataFrame):
         """Learn mappings for categorical features from training data"""
@@ -148,45 +150,22 @@ class NFLDataPreprocessor:
         df['closing_speed'] = 0.0
         
         group_cols = ['game_id', 'play_id', 'frame_id']
-        for _, group in df.groupby(group_cols, sort=False):
-            idx = group.index
-            n_players = len(group)
-            if n_players <= 1:
+        groups = list(df.groupby(group_cols, sort=False))
+        if not groups:
+            return df
+        
+        if self.num_workers > 1:
+            results = Parallel(n_jobs=self.num_workers)(
+                delayed(self._compute_opponent_metrics_for_group)(group)
+                for _, group in groups
+            )
+        else:
+            results = [self._compute_opponent_metrics_for_group(group) for _, group in groups]
+        
+        for idx, nearest_dist, within_3, within_5, closing_speed in results:
+            if idx.size == 0:
                 continue
-            
-            coords = group[['x', 'y']].to_numpy(dtype=np.float32)
-            velocities = group[['vx', 'vy']].to_numpy(dtype=np.float32)
-            sides = (group['player_side'] == 'Offense').to_numpy(dtype=bool)
-            
-            # Pairwise differences -> distances
-            diffs = coords[:, None, :] - coords[None, :, :]           # [N, N, 2]
-            dists = np.linalg.norm(diffs, axis=-1)                    # [N, N]
-            np.fill_diagonal(dists, np.inf)
-            
-            # Opponent mask
-            opp_mask = sides[:, None] != sides[None, :]
-            opp_dists = np.where(opp_mask, dists, np.inf)
-            
-            nearest_idx = np.argmin(opp_dists, axis=1)
-            nearest_dist = opp_dists[np.arange(n_players), nearest_idx]
-            has_opp = np.isfinite(nearest_dist)
-            
-            # Counts within radii
-            within_3 = np.sum((opp_dists < 3.0), axis=1).astype(np.float32)
-            within_5 = np.sum((opp_dists < 5.0), axis=1).astype(np.float32)
-            
-            # Closing speed
-            rel_vectors = coords[nearest_idx] - coords
-            rel_unit = rel_vectors / (nearest_dist[:, None] + 1e-6)
-            rel_vel = velocities[nearest_idx] - velocities
-            closing_speed = -np.einsum('ij,ij->i', rel_vel, rel_unit).astype(np.float32)
-            closing_speed[~has_opp] = 0.0
-            
-            nearest_dist[~has_opp] = 30.0
-            within_3[~has_opp] = 0.0
-            within_5[~has_opp] = 0.0
-            
-            df.loc[idx, 'nearest_opp_dist'] = nearest_dist.astype(np.float32)
+            df.loc[idx, 'nearest_opp_dist'] = nearest_dist
             df.loc[idx, 'near_opp_count_3'] = within_3
             df.loc[idx, 'near_opp_count_5'] = within_5
             df.loc[idx, 'closing_speed'] = closing_speed
@@ -201,25 +180,20 @@ class NFLDataPreprocessor:
         df['route_speed_mean'] = 0.0
         df['route_speed_change'] = 0.0
         
-        for _, group in df.groupby(['game_id', 'play_id', 'nfl_id'], sort=False):
-            group_sorted = group.sort_values('frame_id')
-            idx = group_sorted.index
-            values = group_sorted[['x', 'y', 's']].to_numpy(dtype=np.float32)
-            if len(values) < 2:
-                df.loc[idx, 'route_speed_mean'] = float(values[-1, 2])
+        groups = list(df.groupby(['game_id', 'play_id', 'nfl_id'], sort=False))
+        if self.num_workers > 1:
+            results = Parallel(n_jobs=self.num_workers)(
+                delayed(self._compute_route_features_for_group)(group)
+                for _, group in groups
+            )
+        else:
+            results = [self._compute_route_features_for_group(group) for _, group in groups]
+        
+        for idx, depth, width, straightness, speed_mean, speed_change in results:
+            if idx.size == 0:
                 continue
-            
-            delta = values[-1] - values[0]
-            steps = values[1:, :2] - values[:-1, :2]
-            step_lengths = np.linalg.norm(steps, axis=1)
-            total_distance = float(step_lengths.sum())
-            displacement = float(np.linalg.norm(delta[:2]))
-            straightness = float(displacement / (total_distance + 1e-6))
-            speed_mean = float(values[:, 2].mean())
-            speed_change = float(values[-1, 2] - values[0, 2])
-            
-            df.loc[idx, 'route_depth'] = float(delta[0])
-            df.loc[idx, 'route_width'] = float(delta[1])
+            df.loc[idx, 'route_depth'] = depth
+            df.loc[idx, 'route_width'] = width
             df.loc[idx, 'route_straightness'] = straightness
             df.loc[idx, 'route_speed_mean'] = speed_mean
             df.loc[idx, 'route_speed_change'] = speed_change
@@ -250,6 +224,83 @@ class NFLDataPreprocessor:
         df['geo_alignment'] = geo_alignment
         
         return df
+
+    @staticmethod
+    def _compute_opponent_metrics_for_group(group: pd.DataFrame):
+        idx = group.index.to_numpy(dtype=np.int64)
+        n_players = len(idx)
+        if n_players == 0:
+            return idx, np.array([], dtype=np.float32), np.array([], dtype=np.float32), np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+        if n_players == 1:
+            return (
+                idx,
+                np.full(1, 30.0, dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+            )
+        
+        coords = group[['x', 'y']].to_numpy(dtype=np.float32)
+        velocities = group[['vx', 'vy']].to_numpy(dtype=np.float32)
+        sides = (group['player_side'] == 'Offense').to_numpy(dtype=bool)
+        
+        diffs = coords[:, None, :] - coords[None, :, :]
+        dists = np.linalg.norm(diffs, axis=-1)
+        np.fill_diagonal(dists, np.inf)
+        
+        opp_mask = sides[:, None] != sides[None, :]
+        opp_dists = np.where(opp_mask, dists, np.inf)
+        
+        nearest_idx = np.argmin(opp_dists, axis=1)
+        nearest_dist = opp_dists[np.arange(n_players), nearest_idx]
+        has_opp = np.isfinite(nearest_dist)
+        
+        within_3 = np.sum((opp_dists < 3.0), axis=1, dtype=np.int32).astype(np.float32)
+        within_5 = np.sum((opp_dists < 5.0), axis=1, dtype=np.int32).astype(np.float32)
+        
+        rel_vectors = coords[nearest_idx] - coords
+        rel_unit = rel_vectors / (nearest_dist[:, None] + 1e-6)
+        rel_vel = velocities[nearest_idx] - velocities
+        closing_speed = -np.einsum('ij,ij->i', rel_vel, rel_unit).astype(np.float32)
+        closing_speed[~has_opp] = 0.0
+        
+        nearest_dist = nearest_dist.astype(np.float32)
+        nearest_dist[~has_opp] = 30.0
+        within_3[~has_opp] = 0.0
+        within_5[~has_opp] = 0.0
+        
+        return idx, nearest_dist, within_3, within_5, closing_speed
+
+    @staticmethod
+    def _compute_route_features_for_group(group: pd.DataFrame):
+        group_sorted = group.sort_values('frame_id')
+        idx = group_sorted.index.to_numpy(dtype=np.int64)
+        values = group_sorted[['x', 'y', 's']].to_numpy(dtype=np.float32)
+        n_frames = len(values)
+        if n_frames == 0:
+            zeros = np.zeros(0, dtype=np.float32)
+            return idx, zeros, zeros, zeros, zeros, zeros
+        if n_frames == 1:
+            speed = np.full(1, values[0, 2], dtype=np.float32)
+            zeros = np.zeros(1, dtype=np.float32)
+            return idx, zeros, zeros, zeros, speed, zeros
+        
+        delta = values[-1] - values[0]
+        steps = values[1:, :2] - values[:-1, :2]
+        step_lengths = np.linalg.norm(steps, axis=1)
+        total_distance = float(step_lengths.sum())
+        displacement = float(np.linalg.norm(delta[:2]))
+        straightness = float(displacement / (total_distance + 1e-6))
+        speed_mean = float(values[:, 2].mean())
+        speed_change = float(values[-1, 2] - values[0, 2])
+        
+        depth = np.full(n_frames, float(delta[0]), dtype=np.float32)
+        width = np.full(n_frames, float(delta[1]), dtype=np.float32)
+        straightness_arr = np.full(n_frames, straightness, dtype=np.float32)
+        speed_mean_arr = np.full(n_frames, speed_mean, dtype=np.float32)
+        speed_change_arr = np.full(n_frames, speed_change, dtype=np.float32)
+        
+        return idx, depth, width, straightness_arr, speed_mean_arr, speed_change_arr
     
     def process_output_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Process output tracking data (during ball flight)"""
