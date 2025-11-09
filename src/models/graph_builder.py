@@ -3,8 +3,6 @@ Graph construction for GNN-based trajectory prediction
 """
 
 import torch
-import torch.nn as nn
-import numpy as np
 from typing import Tuple, Optional
 
 from src.data.dataset import FEATURE_INDEX
@@ -15,8 +13,6 @@ IDX_VX = FEATURE_INDEX.get('vx')
 IDX_VY = FEATURE_INDEX.get('vy')
 IDX_AX = FEATURE_INDEX.get('ax')
 IDX_AY = FEATURE_INDEX.get('ay')
-IDX_BALL_SIN = FEATURE_INDEX.get('ball_angle_sin')
-IDX_BALL_COS = FEATURE_INDEX.get('ball_angle_cos')
 
 
 class GraphBuilder:
@@ -35,6 +31,61 @@ class GraphBuilder:
             k_neighbors: Number of nearest neighbors for each player
         """
         self.k_neighbors = k_neighbors
+        self.edge_feature_dim = 9
+        self.eps = 1e-6
+
+    def _get_vector(
+        self,
+        data: torch.Tensor,
+        idx_x: Optional[int],
+        idx_y: Optional[int],
+    ) -> torch.Tensor:
+        if (
+            idx_x is None or idx_y is None or
+            idx_x >= data.size(-1) or idx_y >= data.size(-1)
+        ):
+            return torch.zeros(data.size(0), 2, device=data.device)
+        return torch.stack([data[:, idx_x], data[:, idx_y]], dim=-1)
+
+    def _pairwise_features(
+        self,
+        src_pos: torch.Tensor,
+        tgt_pos: torch.Tensor,
+        src_vel: torch.Tensor,
+        tgt_vel: torch.Tensor,
+        src_acc: torch.Tensor,
+        tgt_acc: torch.Tensor,
+    ) -> torch.Tensor:
+        rel_vec = tgt_pos - src_pos  # [N, 2]
+        dist = torch.norm(rel_vec, dim=-1, keepdim=True).clamp(min=self.eps)
+        rel_dir = rel_vec / dist
+
+        rel_vel = tgt_vel - src_vel
+        speed_along = (rel_vel * rel_dir).sum(dim=-1, keepdim=True)
+        speed_mag = torch.norm(rel_vel, dim=-1, keepdim=True)
+
+        rel_acc = tgt_acc - src_acc
+        acc_along = (rel_acc * rel_dir).sum(dim=-1, keepdim=True)
+        acc_mag = torch.norm(rel_acc, dim=-1, keepdim=True)
+
+        src_speed = torch.norm(src_vel, dim=-1, keepdim=True)
+        heading_alignment = ( (src_vel / (src_speed + self.eps)) * rel_dir ).sum(dim=-1, keepdim=True)
+        heading_alignment = torch.clamp(heading_alignment, -1.0, 1.0)
+
+        time_to_target = dist / (speed_mag + self.eps)
+
+        features = torch.cat([
+            dist,
+            rel_dir,
+            speed_along,
+            speed_mag,
+            acc_along,
+            acc_mag,
+            heading_alignment,
+            time_to_target,
+        ], dim=-1)
+
+        return features
     
     def build_graph(
         self,
@@ -65,161 +116,131 @@ class GraphBuilder:
         # We'll build a single large graph with disconnected components (one per batch item)
         # Each component has num_players + 1 nodes (players + ball)
         
-        all_edge_indices = []
-        all_edge_features = []
+        all_edge_indices: list[torch.Tensor] = []
+        all_edge_features: list[torch.Tensor] = []
         
         for b in range(batch_size):
-            # Get actual number of players (non-padded)
             num_real_players = int(player_mask[b].sum().item())
-            
             if num_real_players == 0:
                 continue
-            
-            # Node offset for this batch item
+
             node_offset = b * (num_players + 1)
-            
-            player_continuous = continuous_features[b, :num_real_players]  # [num_real_players, feat]
+
+            player_continuous = continuous_features[b, :num_real_players]
             player_positions = player_continuous[:, [IDX_X, IDX_Y]]
-            ball_pos = ball_landing[b]  # [2]
+            player_velocities = self._get_vector(player_continuous, IDX_VX, IDX_VY)
+            player_accelerations = self._get_vector(player_continuous, IDX_AX, IDX_AY)
 
-            # Extract velocity and acceleration components if available
-            def get_feature(idx: Optional[int]) -> torch.Tensor:
-                if idx is None or idx >= player_continuous.size(-1):
-                    return torch.zeros_like(player_positions[:, 0])
-                return player_continuous[:, idx]
+            ball_position = ball_landing[b].unsqueeze(0)
+            ball_repeated = ball_position.expand(num_real_players, -1)
+            ball_zero = torch.zeros_like(ball_repeated)
 
-            vx = get_feature(IDX_VX)
-            vy = get_feature(IDX_VY)
-            ax = get_feature(IDX_AX)
-            ay = get_feature(IDX_AY)
-            ball_angle_sin = get_feature(IDX_BALL_SIN)
-            ball_angle_cos = get_feature(IDX_BALL_COS)
-            
-            # Edge list for this play
-            edge_index = []
-            edge_features = []
-            
-            # 1. Player-to-ball edges (bidirectional)
-            ball_node_idx = num_players  # Ball is last node
-            for i in range(num_real_players):
-                # Player to ball
-                edge_index.append([i, ball_node_idx])
-                # Ball to player
-                edge_index.append([ball_node_idx, i])
-                
-                # Edge features: distance, relative position, velocity and acceleration towards ball
-                rel_pos = player_positions[i] - ball_pos
-                dist = torch.norm(rel_pos).item()
+            edge_chunks = []
+            feature_chunks = []
 
-                rel_features = torch.tensor([
-                    dist,
-                    rel_pos[0].item(),
-                    rel_pos[1].item(),
-                    vx[i].item(),
-                    vy[i].item(),
-                    ax[i].item(),
-                    ay[i].item(),
-                    ball_angle_sin[i].item(),
-                    ball_angle_cos[i].item(),
-                ], device=device)
-                edge_features.append(rel_features)
-                edge_features.append(rel_features)
-            
-            # 2. K-nearest neighbor edges
-            if num_real_players > 1:
-                # Compute pairwise distances
-                dist_matrix = torch.cdist(player_positions, player_positions)  # [num_real_players, num_real_players]
-                
-                # For each player, find k nearest neighbors
-                for i in range(num_real_players):
-                    # Get distances to all other players
-                    distances = dist_matrix[i].clone()
-                    distances[i] = float('inf')  # Exclude self
-                    
-                    # Get k nearest
-                    k = min(self.k_neighbors, num_real_players - 1)
-                    _, nearest_indices = torch.topk(distances, k, largest=False)
-                    
-                    # Add edges
-                    for j in nearest_indices:
-                        j = j.item()
-                        edge_index.append([i, j])
-                        
-                        # Edge features
-                        dist = distances[j].item()
-                        rel_pos = player_positions[j] - player_positions[i]
-                        rel_vel = torch.tensor([vx[j] - vx[i], vy[j] - vy[i]], device=device)
-                        rel_acc = torch.tensor([ax[j] - ax[i], ay[j] - ay[i]], device=device)
-                        edge_feat = torch.tensor([
-                            dist,
-                            rel_pos[0].item(),
-                            rel_pos[1].item(),
-                            rel_vel[0].item(),
-                            rel_vel[1].item(),
-                            rel_acc[0].item(),
-                            rel_acc[1].item(),
-                            0.0,
-                            0.0,
-                        ], device=device)
-                        edge_features.append(edge_feat)
-            
-            # 3. Role-specific edges (defensive coverage to targeted receiver)
-            targeted_receiver_idx = None
-            coverage_indices = []
-            
-            for i in range(num_real_players):
-                role = player_roles[b, i].item()
-                if role == 0:  # Targeted Receiver
-                    targeted_receiver_idx = i
-                elif role == 1:  # Defensive Coverage
-                    coverage_indices.append(i)
-            
-            # Add bidirectional edges between coverage and targeted receiver
-            if targeted_receiver_idx is not None:
-                for coverage_idx in coverage_indices:
-                    # Coverage to receiver
-                    edge_index.append([coverage_idx, targeted_receiver_idx])
-                    # Receiver to coverage
-                    edge_index.append([targeted_receiver_idx, coverage_idx])
-                    
-                    # Edge features
-                    rel_pos = player_positions[targeted_receiver_idx] - player_positions[coverage_idx]
-                    dist = torch.norm(rel_pos).item()
-                    rel_vel = torch.tensor([
-                        vx[targeted_receiver_idx] - vx[coverage_idx],
-                        vy[targeted_receiver_idx] - vy[coverage_idx],
-                    ], device=device)
-                    rel_acc = torch.tensor([
-                        ax[targeted_receiver_idx] - ax[coverage_idx],
-                        ay[targeted_receiver_idx] - ay[coverage_idx],
-                    ], device=device)
-                    edge_feat = torch.tensor([
-                        dist,
-                        rel_pos[0].item(),
-                        rel_pos[1].item(),
-                        rel_vel[0].item(),
-                        rel_vel[1].item(),
-                        rel_acc[0].item(),
-                        rel_acc[1].item(),
-                        0.0,
-                        0.0,
-                    ], device=device)
-                    edge_features.append(edge_feat)
-                    edge_features.append(edge_feat)
-            
-            # Offset edge indices by batch
-            if len(edge_index) > 0:
-                edge_index_tensor = torch.tensor(edge_index, device=device).t() + node_offset
-                all_edge_indices.append(edge_index_tensor)
-                all_edge_features.extend(edge_features)
+            player_indices = torch.arange(num_real_players, device=device, dtype=torch.long)
+            ball_node_idx = torch.full((num_real_players,), num_players, device=device, dtype=torch.long)
+
+            # Player -> Ball
+            pb_features = self._pairwise_features(
+                player_positions,
+                ball_repeated,
+                player_velocities,
+                ball_zero,
+                player_accelerations,
+                ball_zero,
+            )
+            edge_pb = torch.stack([player_indices, ball_node_idx], dim=0)
+            edge_chunks.append(edge_pb)
+            feature_chunks.append(pb_features)
+
+            # Ball -> Player
+            bp_features = self._pairwise_features(
+                ball_repeated,
+                player_positions,
+                ball_zero,
+                player_velocities,
+                ball_zero,
+                player_accelerations,
+            )
+            edge_bp = torch.stack([ball_node_idx, player_indices], dim=0)
+            edge_chunks.append(edge_bp)
+            feature_chunks.append(bp_features)
+
+            # K-Nearest Neighbor edges with symmetry
+            if num_real_players > 1 and self.k_neighbors > 0:
+                pairwise_dist = torch.cdist(player_positions, player_positions, p=2)
+                pairwise_dist.fill_diagonal_(float('inf'))
+                k = min(self.k_neighbors, num_real_players - 1)
+                knn_indices = pairwise_dist.topk(k, largest=False).indices  # [N, k]
+
+                src_idx = player_indices.unsqueeze(1).expand(-1, k).reshape(-1)
+                tgt_idx = knn_indices.reshape(-1)
+
+                src_pos = player_positions[src_idx]
+                tgt_pos = player_positions[tgt_idx]
+                src_vel = player_velocities[src_idx]
+                tgt_vel = player_velocities[tgt_idx]
+                src_acc = player_accelerations[src_idx]
+                tgt_acc = player_accelerations[tgt_idx]
+
+                features_knn = self._pairwise_features(src_pos, tgt_pos, src_vel, tgt_vel, src_acc, tgt_acc)
+                edges_knn = torch.stack([src_idx, tgt_idx], dim=0)
+                edge_chunks.append(edges_knn)
+                feature_chunks.append(features_knn)
+
+                features_knn_rev = self._pairwise_features(tgt_pos, src_pos, tgt_vel, src_vel, tgt_acc, src_acc)
+                edges_knn_rev = torch.stack([tgt_idx, src_idx], dim=0)
+                edge_chunks.append(edges_knn_rev)
+                feature_chunks.append(features_knn_rev)
+
+            # Role-specific coverage edges
+            roles = player_roles[b, :num_real_players]
+            targeted_candidates = (roles == 0).nonzero(as_tuple=False).squeeze(-1)
+            coverage_indices = (roles == 1).nonzero(as_tuple=False).squeeze(-1)
+
+            if targeted_candidates.numel() > 0 and coverage_indices.numel() > 0:
+                targeted_idx = targeted_candidates[0]
+                coverage_idx = coverage_indices
+                target_rep = torch.full_like(coverage_idx, targeted_idx)
+
+                cov_features = self._pairwise_features(
+                    player_positions[coverage_idx],
+                    player_positions[target_rep],
+                    player_velocities[coverage_idx],
+                    player_velocities[target_rep],
+                    player_accelerations[coverage_idx],
+                    player_accelerations[target_rep],
+                )
+                cov_edges = torch.stack([coverage_idx, target_rep], dim=0)
+                edge_chunks.append(cov_edges)
+                feature_chunks.append(cov_features)
+
+                rec_features = self._pairwise_features(
+                    player_positions[target_rep],
+                    player_positions[coverage_idx],
+                    player_velocities[target_rep],
+                    player_velocities[coverage_idx],
+                    player_accelerations[target_rep],
+                    player_accelerations[coverage_idx],
+                )
+                rec_edges = torch.stack([target_rep, coverage_idx], dim=0)
+                edge_chunks.append(rec_edges)
+                feature_chunks.append(rec_features)
+
+            if edge_chunks:
+                local_edges = torch.cat(edge_chunks, dim=1)
+                local_features = torch.cat(feature_chunks, dim=0)
+                all_edge_indices.append(local_edges + node_offset)
+                all_edge_features.append(local_features)
         
         # Combine all edges
         if len(all_edge_indices) > 0:
             edge_index = torch.cat(all_edge_indices, dim=1)  # [2, total_edges]
-            edge_features = torch.stack(all_edge_features)  # [total_edges, edge_dim]
+            edge_features = torch.cat(all_edge_features, dim=0)  # [total_edges, edge_dim]
         else:
             edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-            edge_features = torch.zeros((0, 9), device=device)
+            edge_features = torch.zeros((0, self.edge_feature_dim), device=device)
         
         # Create ball node features (use ball landing position + zeros for other features)
         ball_features = torch.zeros(batch_size, 1, feature_dim, device=device)
