@@ -130,18 +130,18 @@ class Trainer:
                 teacher_forcing_ratio=teacher_forcing_ratio,
             )
             
-        # Compute residual targets
-        last_positions = self._get_last_positions(batch)
-        target_residuals = self._compute_residual_sequences(batch['output_positions'], last_positions)
-        pred_residuals = self._compute_residual_sequences(predictions, last_positions)
-        
-        # Compute loss on residuals
-        loss = self.criterion(
-            pred_residuals,
-            target_residuals,
-            batch['player_roles'],
-            batch['output_mask'],
-        )
+            # Compute residual targets
+            last_positions = self._get_last_positions(batch)
+            target_residuals = self._compute_residual_sequences(batch['output_positions'], last_positions)
+            pred_residuals = self._compute_residual_sequences(predictions, last_positions)
+            
+            # Compute loss on residuals
+            loss = self.criterion(
+                pred_residuals,
+                target_residuals,
+                batch['player_roles'],
+                batch['output_mask'],
+            )
             
             # Backward pass
             loss.backward()
