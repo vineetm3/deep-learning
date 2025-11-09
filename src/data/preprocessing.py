@@ -150,42 +150,46 @@ class NFLDataPreprocessor:
         group_cols = ['game_id', 'play_id', 'frame_id']
         for _, group in df.groupby(group_cols, sort=False):
             idx = group.index
-            coords = group[['x', 'y']].to_numpy(dtype=np.float32)
-            vx = group['vx'].to_numpy(dtype=np.float32)
-            vy = group['vy'].to_numpy(dtype=np.float32)
-            sides = (group['player_side'] == 'Offense').to_numpy()
-            n = len(group)
-            
-            if n <= 1:
+            n_players = len(group)
+            if n_players <= 1:
                 continue
             
-            nearest = np.full(n, 30.0, dtype=np.float32)
-            cnt3 = np.zeros(n, dtype=np.float32)
-            cnt5 = np.zeros(n, dtype=np.float32)
-            closing = np.zeros(n, dtype=np.float32)
+            coords = group[['x', 'y']].to_numpy(dtype=np.float32)
+            velocities = group[['vx', 'vy']].to_numpy(dtype=np.float32)
+            sides = (group['player_side'] == 'Offense').to_numpy(dtype=bool)
             
-            for i in range(n):
-                mask = np.ones(n, dtype=bool)
-                mask[i] = False
-                opp_mask = mask & (sides != sides[i])
-                if not np.any(opp_mask):
-                    continue
-                diffs = coords[opp_mask] - coords[i]
-                dists = np.linalg.norm(diffs, axis=1)
-                nearest[i] = float(dists.min())
-                cnt3[i] = float((dists < 3.0).sum())
-                cnt5[i] = float((dists < 5.0).sum())
-                opp_indices = np.where(opp_mask)[0]
-                nearest_idx = opp_indices[dists.argmin()]
-                rel_vx = vx[nearest_idx] - vx[i]
-                rel_vy = vy[nearest_idx] - vy[i]
-                unit = (coords[nearest_idx] - coords[i]) / (nearest[i] + 1e-6)
-                closing[i] = float(-(rel_vx * unit[0] + rel_vy * unit[1]))
+            # Pairwise differences -> distances
+            diffs = coords[:, None, :] - coords[None, :, :]           # [N, N, 2]
+            dists = np.linalg.norm(diffs, axis=-1)                    # [N, N]
+            np.fill_diagonal(dists, np.inf)
             
-            df.loc[idx, 'nearest_opp_dist'] = nearest
-            df.loc[idx, 'near_opp_count_3'] = cnt3
-            df.loc[idx, 'near_opp_count_5'] = cnt5
-            df.loc[idx, 'closing_speed'] = closing
+            # Opponent mask
+            opp_mask = sides[:, None] != sides[None, :]
+            opp_dists = np.where(opp_mask, dists, np.inf)
+            
+            nearest_idx = np.argmin(opp_dists, axis=1)
+            nearest_dist = opp_dists[np.arange(n_players), nearest_idx]
+            has_opp = np.isfinite(nearest_dist)
+            
+            # Counts within radii
+            within_3 = np.sum((opp_dists < 3.0), axis=1).astype(np.float32)
+            within_5 = np.sum((opp_dists < 5.0), axis=1).astype(np.float32)
+            
+            # Closing speed
+            rel_vectors = coords[nearest_idx] - coords
+            rel_unit = rel_vectors / (nearest_dist[:, None] + 1e-6)
+            rel_vel = velocities[nearest_idx] - velocities
+            closing_speed = -np.einsum('ij,ij->i', rel_vel, rel_unit).astype(np.float32)
+            closing_speed[~has_opp] = 0.0
+            
+            nearest_dist[~has_opp] = 30.0
+            within_3[~has_opp] = 0.0
+            within_5[~has_opp] = 0.0
+            
+            df.loc[idx, 'nearest_opp_dist'] = nearest_dist.astype(np.float32)
+            df.loc[idx, 'near_opp_count_3'] = within_3
+            df.loc[idx, 'near_opp_count_5'] = within_5
+            df.loc[idx, 'closing_speed'] = closing_speed
         
         return df
     
@@ -200,25 +204,22 @@ class NFLDataPreprocessor:
         for _, group in df.groupby(['game_id', 'play_id', 'nfl_id'], sort=False):
             group_sorted = group.sort_values('frame_id')
             idx = group_sorted.index
-            if len(group_sorted) < 2:
-                df.loc[idx, 'route_speed_mean'] = float(group_sorted['s'].iloc[-1])
+            values = group_sorted[['x', 'y', 's']].to_numpy(dtype=np.float32)
+            if len(values) < 2:
+                df.loc[idx, 'route_speed_mean'] = float(values[-1, 2])
                 continue
             
-            x_vals = group_sorted['x'].to_numpy(dtype=np.float32)
-            y_vals = group_sorted['y'].to_numpy(dtype=np.float32)
-            s_vals = group_sorted['s'].to_numpy(dtype=np.float32)
+            delta = values[-1] - values[0]
+            steps = values[1:, :2] - values[:-1, :2]
+            step_lengths = np.linalg.norm(steps, axis=1)
+            total_distance = float(step_lengths.sum())
+            displacement = float(np.linalg.norm(delta[:2]))
+            straightness = float(displacement / (total_distance + 1e-6))
+            speed_mean = float(values[:, 2].mean())
+            speed_change = float(values[-1, 2] - values[0, 2])
             
-            dx = float(x_vals[-1] - x_vals[0])
-            dy = float(y_vals[-1] - y_vals[0])
-            steps = np.sqrt(np.diff(x_vals)**2 + np.diff(y_vals)**2)
-            total_dist = float(steps.sum())
-            displacement = float(np.sqrt(dx**2 + dy**2))
-            straightness = float(displacement / (total_dist + 1e-6))
-            speed_mean = float(s_vals.mean())
-            speed_change = float(s_vals[-1] - s_vals[0])
-            
-            df.loc[idx, 'route_depth'] = dx
-            df.loc[idx, 'route_width'] = dy
+            df.loc[idx, 'route_depth'] = float(delta[0])
+            df.loc[idx, 'route_width'] = float(delta[1])
             df.loc[idx, 'route_straightness'] = straightness
             df.loc[idx, 'route_speed_mean'] = speed_mean
             df.loc[idx, 'route_speed_change'] = speed_change
